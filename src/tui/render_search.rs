@@ -869,6 +869,13 @@ fn render_session_header_line(
     } else {
         Style::default().fg(BRANCH_FG).add_modifier(Modifier::BOLD)
     };
+    // Same Iosevka/kitty bold-clipping reason as the `▶` caret above; the
+    // branch name keeps BOLD because its glyphs stay within their cells.
+    let branch_marker = if selected {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(BRANCH_FG)
+    };
     let count = if selected {
         base
     } else {
@@ -888,7 +895,8 @@ fn render_session_header_line(
         Span::styled(" · ".to_string(), base),
         Span::styled(p.project.to_string(), project),
         Span::styled("  ".to_string(), base),
-        Span::styled(format!("⎇ {}", p.branch), style_with_bg(branch, row_bg)),
+        Span::styled("⎇ ".to_string(), style_with_bg(branch_marker, row_bg)),
+        Span::styled(p.branch.to_string(), style_with_bg(branch, row_bg)),
         Span::styled(
             format!(" · {} ", display_session_id(p.session_id, p.provider)),
             base,
@@ -3159,14 +3167,23 @@ mod tests {
             "project should be bold"
         );
 
-        let branch_marker = format!("⎇ {branch}");
-        let (branch_x, branch_y) = find_cell_for_text(buffer, width, height, &branch_marker)
-            .unwrap_or_else(|| panic!("branch {branch_marker:?} should render"));
+        let marker_text = "⎇";
+        let (marker_x, marker_y) = find_cell_for_text(buffer, width, height, marker_text)
+            .unwrap_or_else(|| panic!("branch marker {marker_text:?} should render"));
+        let marker_cell = buffer.cell((marker_x, marker_y)).unwrap();
+        assert_eq!(marker_cell.fg, BRANCH_FG);
+        assert!(
+            !marker_cell.modifier.contains(Modifier::BOLD),
+            "branch marker must stay non-bold to avoid kitty/Iosevka right-edge clipping"
+        );
+
+        let (branch_x, branch_y) = find_cell_for_text(buffer, width, height, branch)
+            .unwrap_or_else(|| panic!("branch {branch:?} should render"));
         let branch_cell = buffer.cell((branch_x, branch_y)).unwrap();
         assert_eq!(branch_cell.fg, BRANCH_FG);
         assert!(
             branch_cell.modifier.contains(Modifier::BOLD),
-            "branch marker should be bold"
+            "branch name should be bold"
         );
     }
 
