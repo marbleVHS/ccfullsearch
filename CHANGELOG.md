@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.14.0 - 2026-05-11
+
+### New Features
+- Ctrl+A project filter now includes Codex sessions — match by Codex `session_meta.payload.cwd` (canonicalized) in addition to Claude file-path prefixes; status bar shows `· Codex: ≤100 by recency` to surface the scan-scope asymmetry. Asymmetric direction (`session.cwd` ⊆ `current_cwd`) prevents `$HOME`-launched Codex from matching every project under `$HOME`.
+
+### Fixed
+- Branch `⎇` marker no longer clips on selected rows in kitty with Iosevka/JetBrains Mono Nerd — drop `Modifier::BOLD` from the marker span (branch name keeps its bold).
+
 ## v0.13.0 - 2026-05-04
 
 ### New Features
