@@ -106,4 +106,4 @@ The `SessionSource` enum in `session/mod.rs` drives format-specific parsing thro
 
 ## Release
 
-Uses **cargo-dist** for multi-platform builds triggered by version tags. Homebrew tap at `materkey/homebrew-ccs`. Manual `cargo publish` for crates.io.
+Uses **cargo-dist** for multi-platform builds triggered by version tags. Homebrew tap at `materkey/homebrew-ccs`. Crates.io publish runs from `.github/workflows/publish-crates.yml` on the `release: published` event (needs repo secret `CARGO_REGISTRY_TOKEN`). See `.claude/skills/release-ccs/SKILL.md` for the full flow.
