@@ -89,6 +89,15 @@ pub fn cli_list(search_paths: &[String], limit: usize) {
         .filter_map(|path| extract_session_metadata(&path))
         .collect();
 
+    // Opencode storage isn't JSONL-shaped — pull those sessions from their
+    // own layout so `ccs list` is provider-complete. Only walk when an
+    // Opencode database is reachable via the caller's search paths, matching
+    // `collect_recent_sessions` so tests with synthetic temp roots don't
+    // pick up the user's real DB.
+    if search_paths.iter().any(|p| p.contains("/opencode.db")) {
+        sessions.extend(collect_opencode_list_entries(search_paths));
+    }
+
     // Sort by last_active descending
     sessions.sort_by(|a, b| b.last_active.cmp(&a.last_active));
 
@@ -101,6 +110,33 @@ pub fn cli_list(search_paths: &[String], limit: usize) {
             println!("{}", json);
         }
     }
+}
+
+fn collect_opencode_list_entries(search_paths: &[String]) -> Vec<ListResult> {
+    use crate::recent::opencode_databases_for_search_paths;
+    use crate::session::opencode::{self, list_sessions, load_messages};
+    let dbs = opencode_databases_for_search_paths(search_paths);
+    if dbs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for db in &dbs {
+        for session in list_sessions(db) {
+            let project = opencode::read_project_label(db, &session.project_id)
+                .unwrap_or_else(|| session.project_id.clone());
+            let message_count = load_messages(db, &session.id).len();
+            out.push(ListResult {
+                session_id: session.id,
+                project,
+                provider: "Opencode".to_string(),
+                source: SessionSource::CLI.display_name().to_string(),
+                file_path: session.session_file.to_string_lossy().to_string(),
+                last_active: session.updated_at.to_rfc3339(),
+                message_count,
+            });
+        }
+    }
+    out
 }
 
 /// Extract metadata from a single .jsonl file by reading first and last messages

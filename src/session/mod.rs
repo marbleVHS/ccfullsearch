@@ -1,3 +1,4 @@
+pub mod opencode;
 pub mod record;
 
 use chrono::{DateTime, Utc};
@@ -9,11 +10,12 @@ use std::path::{Path, PathBuf};
 /// Codex stores rollout transcripts under one of these subdirectories of `CODEX_HOME`.
 pub(crate) const CODEX_SESSION_SUBDIRS: [&str; 2] = ["sessions", "archived_sessions"];
 
-/// Source of the Claude session
+/// Source of the session (Desktop vs CLI)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSource {
-    /// Claude Code CLI sessions stored in ~/.claude/projects/
-    ClaudeCodeCLI,
+    /// Any CLI-driven session (Claude Code CLI, Codex, Opencode, ...). Use
+    /// `SessionProvider::from_path` to disambiguate which CLI.
+    CLI,
     /// Claude Desktop app sessions stored in ~/Library/Application Support/Claude/
     ClaudeDesktop,
 }
@@ -24,14 +26,14 @@ impl SessionSource {
         if path.contains("local-agent-mode-sessions") {
             SessionSource::ClaudeDesktop
         } else {
-            SessionSource::ClaudeCodeCLI
+            SessionSource::CLI
         }
     }
 
     /// Returns display name for the source
     pub fn display_name(&self) -> &'static str {
         match self {
-            SessionSource::ClaudeCodeCLI => "CLI",
+            SessionSource::CLI => "CLI",
             SessionSource::ClaudeDesktop => "Desktop",
         }
     }
@@ -44,11 +46,16 @@ pub enum SessionProvider {
     Claude,
     /// Codex CLI session.
     Codex,
+    /// Opencode session.
+    Opencode,
 }
 
 impl SessionProvider {
     /// Detect the session provider from the transcript path.
     pub fn from_path(path: &str) -> Self {
+        if opencode::is_opencode_session_path(path) {
+            return SessionProvider::Opencode;
+        }
         let normalized = normalize_session_path(path);
         let is_codex = normalized.contains("/.codex/sessions/")
             || normalized.contains("/.codex/archived_sessions/")
@@ -69,6 +76,7 @@ impl SessionProvider {
         match self {
             SessionProvider::Claude => "Claude",
             SessionProvider::Codex => "Codex",
+            SessionProvider::Opencode => "Opencode",
         }
     }
 }
@@ -431,6 +439,15 @@ pub fn collect_session_jsonl_files(search_paths: &[String]) -> Vec<PathBuf> {
 pub fn find_session_file_in_paths(session_id: &str, search_paths: &[String]) -> Option<String> {
     use std::io::{BufRead, BufReader};
 
+    // Opencode session IDs start with `ses_` and live in a SQLite DB.
+    if session_id.starts_with("ses_") {
+        if let Some(db) = opencode::opencode_database_path() {
+            if opencode::OpencodeSession::from_db(&db, session_id).is_some() {
+                return Some(opencode::synthetic_session_path(&db, session_id));
+            }
+        }
+    }
+
     let target_filename = format!("{}.jsonl", session_id);
     let mut audit_match: Option<String> = None;
 
@@ -570,7 +587,7 @@ mod tests {
     #[test]
     fn test_session_source_from_cli_path() {
         let path = "/Users/user/.claude/projects/-Users-user-myproject/abc123.jsonl";
-        assert_eq!(SessionSource::from_path(path), SessionSource::ClaudeCodeCLI);
+        assert_eq!(SessionSource::from_path(path), SessionSource::CLI);
     }
 
     #[test]
@@ -581,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_session_source_display_name() {
-        assert_eq!(SessionSource::ClaudeCodeCLI.display_name(), "CLI");
+        assert_eq!(SessionSource::CLI.display_name(), "CLI");
         assert_eq!(SessionSource::ClaudeDesktop.display_name(), "Desktop");
     }
 

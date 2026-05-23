@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use crate::dag::{DisplayFilter, SessionDag, TipStrategy};
 use crate::search::{count_session_messages, extract_project_from_path};
-use crate::session::record::{ContentMode, MessageRole, SessionRecord};
+use crate::session::opencode::{self, list_sessions, opencode_database_path, OpencodeSession};
+use crate::session::record::{ContentBlock, ContentMode, MessageRole, SessionRecord};
 use crate::session::{self, SessionProvider, SessionSource};
 
 const HEAD_SCAN_LINES: usize = 30;
@@ -667,7 +668,7 @@ pub fn extract_summary(path: &Path) -> Option<RecentSession> {
     let need_user_msg = first_user_message.is_none();
     let need_sid = last_summary_sid.is_none() && session_id.is_none();
     let need_automation = automation.is_none();
-    let need_branch = branch.is_none() && source == SessionSource::ClaudeCodeCLI;
+    let need_branch = branch.is_none() && source == SessionSource::CLI;
     let should_scan_middle = (need_summary && tail_start > 0)
         || need_user_msg
         || need_sid
@@ -840,6 +841,143 @@ pub(crate) fn sort_recent_sessions_desc(sessions: &mut [RecentSession]) {
 ///
 /// When timestamps tie, file path is used as a deterministic fallback so
 /// equal-timestamp sessions do not produce unstable ordering across platforms.
+/// Build a `RecentSession` from an Opencode SQLite session row.
+///
+/// `session.title` is the preferred preview text — Opencode auto-generates it
+/// from the first prompt. When `title` is empty (e.g. brand-new sessions), we
+/// fall back to the text of the first user message.
+pub fn opencode_session_to_recent(db: &Path, session: &OpencodeSession) -> Option<RecentSession> {
+    let project = opencode::read_project_label(db, &session.project_id)
+        .or_else(|| {
+            session
+                .directory
+                .as_deref()
+                .and_then(|d| Path::new(d).file_name().and_then(|n| n.to_str()))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| session.project_id.clone());
+
+    // Count messages cheaply via a single COUNT query rather than loading
+    // every part. Even on sessions with hundreds of messages this is sub-ms.
+    let message_count = opencode_message_count(db, &session.id);
+
+    let (summary, preview_role) = if !session.title.trim().is_empty() {
+        (
+            truncate_summary(&session.title, 100),
+            MessageRole::Assistant,
+        )
+    } else {
+        // Title hasn't been generated yet — pull the first user message's text.
+        let messages = opencode::load_messages(db, &session.id);
+        let first_user = messages.into_iter().find(|m| m.role == MessageRole::User)?;
+        let text = first_user
+            .content_blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        (truncate_summary(trimmed, 100), MessageRole::User)
+    };
+
+    let cwd = session.directory.as_ref().map(|raw| {
+        std::fs::canonicalize(raw)
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| raw.clone())
+    });
+
+    Some(RecentSession {
+        session_id: session.id.clone(),
+        file_path: session.session_file.to_string_lossy().to_string(),
+        project,
+        source: SessionSource::CLI,
+        timestamp: session.updated_at,
+        summary,
+        automation: None,
+        branch: None,
+        message_count,
+        preview_role,
+        cwd,
+    })
+}
+
+fn opencode_message_count(db: &Path, session_id: &str) -> Option<usize> {
+    let conn = opencode::open_db(db).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM message WHERE session_id = ?1")
+        .ok()?;
+    let count: i64 = stmt.query_row([session_id], |row| row.get(0)).ok()?;
+    (count > 0).then_some(count as usize)
+}
+
+/// Pick the Opencode SQLite databases to query for a given set of search
+/// paths.
+///
+/// If any entry in `search_paths` points at a `.db` file (e.g.
+/// `CCFS_SEARCH_PATH=/path/opencode.db`), use those exact paths — this lets
+/// tests and tools target a specific database without leaking to the
+/// developer's real DB. Otherwise fall back to the default lookup
+/// (`$OPENCODE_DATA`, then platform default).
+pub fn opencode_databases_for_search_paths(search_paths: &[String]) -> Vec<PathBuf> {
+    let any_explicit = search_paths.iter().any(|p| p.contains("/opencode.db"));
+
+    if any_explicit {
+        // The caller has opinions — honour them strictly. If their explicit
+        // path doesn't exist on disk, return an empty Vec rather than
+        // silently leaking to the developer's real database.
+        return search_paths
+            .iter()
+            .filter(|p| p.contains("/opencode.db"))
+            .filter_map(|p| {
+                // A search path of `<db>#<sid>` (synthetic session path)
+                // should still resolve to `<db>` so the loader hits the
+                // right database.
+                let db = match p.rsplit_once('#') {
+                    Some((db, _)) => db,
+                    None => p.as_str(),
+                };
+                let path = PathBuf::from(db);
+                path.exists().then_some(path)
+            })
+            .collect();
+    }
+
+    opencode_database_path().into_iter().collect()
+}
+
+/// Query the Opencode database(s) reachable from the given search paths and
+/// return up to `limit` most-recently-updated sessions per database, merged
+/// and re-sorted.
+pub fn collect_opencode_recent_sessions(
+    search_paths: &[String],
+    limit: usize,
+) -> Vec<RecentSession> {
+    let dbs = opencode_databases_for_search_paths(search_paths);
+    if dbs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sessions: Vec<RecentSession> = Vec::new();
+    for db in &dbs {
+        let listing = list_sessions(db);
+        let from_this_db: Vec<RecentSession> = listing
+            .par_iter()
+            .filter_map(|s| opencode_session_to_recent(db, s))
+            .collect();
+        sessions.extend(from_this_db);
+    }
+    sort_recent_sessions_desc(&mut sessions);
+    sessions.truncate(limit);
+    sessions
+}
+
 pub fn collect_recent_sessions(search_paths: &[String], limit: usize) -> Vec<RecentSession> {
     let files = find_jsonl_files(search_paths);
 
@@ -864,6 +1002,16 @@ pub fn collect_recent_sessions(search_paths: &[String], limit: usize) -> Vec<Rec
 
     let mut sessions = collect_from_files(manual_files, limit);
     sessions.extend(collect_from_files(auto_files, limit));
+
+    // Opencode storage isn't JSONL-shaped, so the JSONL walker above sees
+    // nothing under it. Pull Opencode sessions from their own storage layout
+    // and fold them into the same dedup/sort pipeline. Only walk Opencode
+    // storage when the caller explicitly included an Opencode root in
+    // `search_paths` — otherwise tests with synthetic temp roots would
+    // pick up the user's real Opencode sessions.
+    if search_paths.iter().any(|p| p.contains("/opencode.db")) {
+        sessions.extend(collect_opencode_recent_sessions(search_paths, limit));
+    }
 
     // Merge-level dedup across partitions (rare: same session_id appearing in both
     // manual and auto pools — possible only if the two pools somehow share a file,
@@ -990,7 +1138,7 @@ mod tests {
             session_id: "sess-linear-001".to_string(),
             file_path: "/Users/user/.claude/projects/-Users-user-myproject/abc.jsonl".to_string(),
             project: "myproject".to_string(),
-            source: SessionSource::ClaudeCodeCLI,
+            source: SessionSource::CLI,
             timestamp: ts,
             summary: "How do I sort a list in Python?".to_string(),
             automation: None,
@@ -1001,7 +1149,7 @@ mod tests {
         };
         assert_eq!(session.session_id, "sess-linear-001");
         assert_eq!(session.project, "myproject");
-        assert_eq!(session.source, SessionSource::ClaudeCodeCLI);
+        assert_eq!(session.source, SessionSource::CLI);
         assert_eq!(session.timestamp, ts);
         assert_eq!(session.summary, "How do I sort a list in Python?");
         assert_eq!(session.branch.as_deref(), Some("main"));
@@ -1060,6 +1208,40 @@ mod tests {
         assert_eq!(
             strip_leading_recog_automation_marker(text),
             "Придумай короткое название"
+        );
+    }
+
+    #[test]
+    fn test_opencode_databases_for_search_paths_prefers_explicit_db() {
+        // Build a real (empty-but-valid) SQLite file at a temp location and
+        // pass it explicitly via `search_paths`. The helper should return
+        // that exact path, not whatever opencode_database_path() resolves to
+        // on the developer's machine.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("opencode.db");
+        std::fs::write(&db, b"SQLite format 3\0").unwrap();
+
+        let synth = format!("{}#ses_42", db.to_string_lossy());
+        let resolved = opencode_databases_for_search_paths(&[synth]);
+        assert_eq!(resolved, vec![db.clone()]);
+
+        // Bare DB path also works.
+        let resolved = opencode_databases_for_search_paths(&[db.to_string_lossy().into_owned()]);
+        assert_eq!(resolved, vec![db]);
+    }
+
+    #[test]
+    fn test_opencode_databases_for_search_paths_skips_missing_explicit() {
+        // A `search_paths` entry that points at a non-existent DB must NOT
+        // be returned (and must not fall through to opencode_database_path()
+        // either — falling through would silently leak to the user's real DB).
+        let resolved = opencode_databases_for_search_paths(&[
+            "/definitely/does/not/exist/opencode.db".to_string(),
+        ]);
+        assert!(
+            resolved.is_empty(),
+            "explicit DB that doesn't exist must produce no fallback: {:?}",
+            resolved
         );
     }
 

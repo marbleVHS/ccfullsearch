@@ -72,6 +72,14 @@ pub fn get_search_paths() -> Vec<String> {
             }
         }
 
+        // Opencode SQLite database. The search layer dispatches paths
+        // ending in `opencode.db` to a SQL-based scanner instead of ripgrep.
+        if let Some(db) = session::opencode::opencode_database_path() {
+            if let Some(p) = db.to_str().map(|s| s.to_string()) {
+                search_paths.push(p);
+            }
+        }
+
         // Fallback if no paths found (e.g. to_str() failed on non-UTF8 home)
         if search_paths.is_empty() {
             if let Some(p) = home

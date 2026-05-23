@@ -1,10 +1,11 @@
 use super::Message;
+use crate::session::opencode::{self, OpencodeSession};
 use crate::session::resolve_parent_session;
 use crate::session::{self, SessionProvider, SessionSource};
 use regex::RegexBuilder;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -208,6 +209,22 @@ fn search_multiple_paths_inner(
         }
 
         if !std::path::Path::new(search_path).exists() {
+            continue;
+        }
+
+        // Opencode storage roots are not JSONL-shaped — dispatch to a
+        // separate scanner that globs `*.json` under `<root>/part/` and
+        // resolves matches back to a session via metadata lookup.
+        if is_opencode_storage_path(search_path) {
+            let results = search_opencode_storage(
+                query,
+                search_path,
+                use_regex,
+                regex_matcher.as_ref(),
+                cancel,
+                extra_args,
+            )?;
+            all_results.extend(results);
             continue;
         }
 
@@ -502,6 +519,97 @@ fn search_single_path(
     Ok((results, truncated))
 }
 
+/// Recognize an Opencode storage root for dispatch in
+/// `search_multiple_paths_inner` dispatches search paths ending in
+/// `opencode.db` to the SQLite-backed Opencode search instead of ripgrep.
+fn is_opencode_storage_path(path: &str) -> bool {
+    let normalized = if path.contains('\\') {
+        path.replace('\\', "/")
+    } else {
+        path.to_string()
+    };
+    normalized.ends_with("/opencode.db") || normalized.contains("/opencode.db")
+}
+
+/// Search the Opencode SQLite database for the given query.
+///
+/// Backed by [`opencode::search_parts`], which runs a case-insensitive `LIKE`
+/// against the `part.data` JSON column and post-filters in Rust against the
+/// rendered (user-visible) text. For each hit we look up the owning session
+/// and message metadata so the result carries the same shape as a JSONL
+/// ripgrep match: synthetic `file_path = <db>#<session_id>`, role pulled from
+/// `message.role`, timestamp from `message.time.created`.
+fn search_opencode_storage(
+    query: &str,
+    storage_path: &str,
+    _use_regex: bool,
+    regex_matcher: Option<&regex::Regex>,
+    cancel: &Arc<AtomicBool>,
+    _extra_args: &[String],
+) -> Result<Vec<RipgrepMatch>, String> {
+    let db = PathBuf::from(storage_path);
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+
+    // Regex queries skip the SQL LIKE prefilter (a regex can't be expressed
+    // as a single LIKE pattern, so the literal text would miss matches like
+    // `hello\s+opencode`). Fixed-string queries keep the prefilter so SQLite
+    // doesn't scan every row.
+    let mode = match regex_matcher {
+        Some(re) => opencode::SearchMode::Regex(re),
+        None => opencode::SearchMode::Fixed,
+    };
+    let hits = opencode::search_parts(&db, query, mode);
+
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
+
+    let mut session_cache: HashMap<String, Option<OpencodeSession>> = HashMap::new();
+    let mut results = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let session = session_cache
+            .entry(hit.session_id.clone())
+            .or_insert_with(|| OpencodeSession::from_db(&db, &hit.session_id))
+            .clone();
+        let Some(session) = session else {
+            continue;
+        };
+
+        let (role, timestamp) = opencode::read_message_role_and_time(&db, &hit.message_id)
+            .map(|(role, ts)| {
+                let role_str = match role {
+                    crate::session::record::MessageRole::User => "user",
+                    crate::session::record::MessageRole::Assistant => "assistant",
+                };
+                (role_str.to_string(), ts)
+            })
+            .unwrap_or_else(|| ("assistant".to_string(), session.updated_at));
+
+        results.push(RipgrepMatch {
+            file_path: session.session_file.to_string_lossy().to_string(),
+            message: Some(Message {
+                session_id: session.id.clone(),
+                role,
+                content: hit.text.clone(),
+                text_content: hit.text,
+                timestamp,
+                branch: None,
+                line_number: 1,
+                uuid: Some(hit.message_id),
+                parent_uuid: None,
+            }),
+            source: SessionSource::CLI,
+        });
+    }
+    Ok(results)
+}
+
 /// Check if a file path belongs to an agent or subagent session.
 /// Returns true for paths containing `/subagents/` or filenames starting with `agent-`.
 fn is_agent_or_subagent_path(path: &str) -> bool {
@@ -578,6 +686,26 @@ pub fn extract_project_from_path(path: &str) -> String {
         if let Some(project) = read_codex_session_project(path) {
             return project;
         }
+    }
+
+    // Opencode synthetic path: `<db>#<session_id>`. Resolve through the DB
+    // so the project label matches what `list_sessions` / recent uses.
+    if SessionProvider::from_path(path) == SessionProvider::Opencode {
+        if let Some((db, sid)) = opencode::parse_session_path(path) {
+            if let Some(session) = OpencodeSession::from_db(&db, &sid) {
+                if let Some(label) = opencode::read_project_label(&db, &session.project_id) {
+                    return label;
+                }
+                if let Some(dir) = session
+                    .directory
+                    .as_deref()
+                    .and_then(|d| Path::new(d).file_name().and_then(|n| n.to_str()))
+                {
+                    return dir.to_string();
+                }
+            }
+        }
+        return "Opencode".to_string();
     }
 
     // Check for Desktop session name in path (e.g., -sessions-wizardly-vibrant-dirac)
