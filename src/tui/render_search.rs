@@ -14,6 +14,7 @@ use ratatui::{
     Frame,
 };
 use regex::RegexBuilder;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 /// RGB(75,0,130) — the selected-row background used across every list
@@ -833,19 +834,32 @@ fn format_session_header_line(p: SessionHeaderParts<'_>) -> String {
     )
 }
 
-fn display_session_id(session_id: &str, provider: SessionProvider) -> &str {
-    let max_len = match provider {
+fn display_session_id<'a>(session_id: &'a str, provider: SessionProvider) -> Cow<'a, str> {
+    match provider {
         // Codex uses UUIDv7 rollout IDs, where the first 8 chars are mostly a
         // timestamp prefix. Include the next UUID segment to distinguish
         // sessions created in the same second.
-        SessionProvider::Codex if session_id.as_bytes().get(8) == Some(&b'-') => 13,
-        _ => 8,
-    };
+        SessionProvider::Codex if session_id.as_bytes().get(8) == Some(&b'-') => {
+            truncate_prefix(session_id, 13)
+        }
+        // Opencode IDs are `ses_<ULID-ish>`. The ULID encodes a time/counter
+        // in its leading bytes, so sessions created in the same hour share
+        // their first ~12 chars and collide visibly when truncated from the
+        // start. Keep the `ses_` sigil and suffix-truncate so distinct
+        // sessions render distinct short labels.
+        SessionProvider::Opencode if session_id.starts_with("ses_") && session_id.len() > 12 => {
+            let suffix = &session_id[session_id.len() - 8..];
+            Cow::Owned(format!("ses_…{suffix}"))
+        }
+        _ => truncate_prefix(session_id, 8),
+    }
+}
 
+fn truncate_prefix(session_id: &str, max_len: usize) -> Cow<'_, str> {
     if session_id.len() > max_len {
-        &session_id[..max_len]
+        Cow::Borrowed(&session_id[..max_len])
     } else {
-        session_id
+        Cow::Borrowed(session_id)
     }
 }
 
@@ -3303,16 +3317,20 @@ mod tests {
         let backend = TestBackend::new(120, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
+        // Realistic Opencode session id (4-char `ses_` sigil + 26-char
+        // ULID-ish suffix). The display layer must show the *suffix*, not the
+        // prefix, so distinct sessions stay visually distinguishable.
+        let session_id = "ses_3f1f05d9effe6iVgV05J8wZ0w2";
         let mut app = App::new(vec!["/test".to_string()]);
         app.recent.loading = false;
         app.recent.load_rx = None;
         app.recent.filtered = vec![RecentSession {
-            session_id: "ses_OC1".to_string(),
+            session_id: session_id.to_string(),
             // Path must match `is_opencode_session_path` so SessionProvider::from_path
             // returns Opencode and the badge label resolves to "OC". The synthetic
             // shape is `<db_path>#<session_id>` — same format the recent loader
             // writes onto every Opencode RecentSession.
-            file_path: "/tmp/opencode/opencode.db#ses_OC1".to_string(),
+            file_path: format!("/tmp/opencode/opencode.db#{session_id}"),
             project: "opencode-project".to_string(),
             source: SessionSource::CLI,
             timestamp: Utc.with_ymd_and_hms(2026, 4, 30, 10, 0, 0).unwrap(),
@@ -3336,6 +3354,91 @@ mod tests {
             badge_x,
             120 - badge.chars().count() as u16,
             "OC badge should align to the right edge"
+        );
+
+        let suffix = &session_id[session_id.len() - 8..];
+        let short = format!("ses_…{suffix}");
+        assert!(
+            find_cell_for_text(terminal.backend().buffer(), 120, 24, &short).is_some(),
+            "Opencode short id should render with the suffix ({short:?})"
+        );
+        let prefix_8 = &session_id[..8];
+        assert!(
+            find_cell_for_text(terminal.backend().buffer(), 120, 24, prefix_8).is_none(),
+            "Opencode short id must not render the leading {prefix_8:?} prefix"
+        );
+    }
+
+    #[test]
+    fn test_render_recent_distinguishes_opencode_ids_sharing_prefix() {
+        use crate::recent::RecentSession;
+        use chrono::TimeZone;
+
+        let backend = TestBackend::new(120, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Two Opencode session ids whose first 12 chars are identical. The
+        // old prefix-truncation rendered them both as `ses_3f1f`, hiding the
+        // distinction in the recent list. After suffix-truncation they must
+        // produce distinct short labels.
+        let id_a = "ses_3f1f05d9effe6iVgV05J8wZ0w2";
+        let id_b = "ses_3f1f05d9effe6iVgV05K9xA1y3";
+        assert_eq!(
+            &id_a[..12],
+            &id_b[..12],
+            "test setup invariant: ids share their first 12 chars",
+        );
+
+        let mut app = App::new(vec!["/test".to_string()]);
+        app.recent.loading = false;
+        app.recent.load_rx = None;
+        app.recent.filtered = vec![
+            RecentSession {
+                session_id: id_a.to_string(),
+                file_path: format!("/tmp/opencode/opencode.db#{id_a}"),
+                project: "project-a".to_string(),
+                source: SessionSource::CLI,
+                timestamp: Utc.with_ymd_and_hms(2026, 4, 30, 10, 0, 0).unwrap(),
+                summary: "session a".to_string(),
+                automation: None,
+                branch: None,
+                message_count: Some(1),
+                preview_role: MessageRole::User,
+                cwd: None,
+            },
+            RecentSession {
+                session_id: id_b.to_string(),
+                file_path: format!("/tmp/opencode/opencode.db#{id_b}"),
+                project: "project-b".to_string(),
+                source: SessionSource::CLI,
+                timestamp: Utc.with_ymd_and_hms(2026, 4, 30, 9, 0, 0).unwrap(),
+                summary: "session b".to_string(),
+                automation: None,
+                branch: None,
+                message_count: Some(1),
+                preview_role: MessageRole::User,
+                cwd: None,
+            },
+        ];
+        app.recent.cursor = 99;
+
+        terminal
+            .draw(|frame| render(frame, &app.view()))
+            .expect("Render should not panic");
+
+        let short_a = format!("ses_…{}", &id_a[id_a.len() - 8..]);
+        let short_b = format!("ses_…{}", &id_b[id_b.len() - 8..]);
+        assert_ne!(
+            short_a, short_b,
+            "suffix-truncated labels must differ for ids that share the prefix"
+        );
+        assert!(
+            find_cell_for_text(terminal.backend().buffer(), 120, 24, &short_a).is_some(),
+            "first session's short id should render: {short_a:?}"
+        );
+        assert!(
+            find_cell_for_text(terminal.backend().buffer(), 120, 24, &short_b).is_some(),
+            "second session's short id should render: {short_b:?}"
         );
     }
 

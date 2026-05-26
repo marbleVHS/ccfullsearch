@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::dag::{DisplayFilter, SessionDag, TipStrategy};
 use crate::search::{count_session_messages, extract_project_from_path};
-use crate::session::opencode::{self, list_sessions, opencode_database_path, OpencodeSession};
+use crate::session::opencode::{self, opencode_database_path, OpencodeSessionSummary};
 use crate::session::record::{ContentBlock, ContentMode, MessageRole, SessionRecord};
 use crate::session::{self, SessionProvider, SessionSource};
 
@@ -841,34 +841,38 @@ pub(crate) fn sort_recent_sessions_desc(sessions: &mut [RecentSession]) {
 ///
 /// When timestamps tie, file path is used as a deterministic fallback so
 /// equal-timestamp sessions do not produce unstable ordering across platforms.
-/// Build a `RecentSession` from an Opencode SQLite session row.
+/// Build a `RecentSession` from a single Opencode JOIN-summary row.
 ///
-/// `session.title` is the preferred preview text — Opencode auto-generates it
-/// from the first prompt. When `title` is empty (e.g. brand-new sessions), we
-/// fall back to the text of the first user message.
-pub fn opencode_session_to_recent(db: &Path, session: &OpencodeSession) -> Option<RecentSession> {
-    let project = opencode::read_project_label(db, &session.project_id)
+/// `summary.title` is the preferred preview text — Opencode auto-generates
+/// it from the first prompt. When `title` is empty (e.g. brand-new sessions
+/// inside the returned LIMIT window), fall back to `load_messages` for the
+/// first user message. Per-row enrichment is bounded by the caller's
+/// `LIMIT`, so this fallback never explodes into O(N) full message reads.
+pub fn opencode_summary_to_recent(
+    db: &Path,
+    summary: &OpencodeSessionSummary,
+) -> Option<RecentSession> {
+    let project = summary
+        .project_label
+        .clone()
         .or_else(|| {
-            session
+            summary
                 .directory
                 .as_deref()
                 .and_then(|d| Path::new(d).file_name().and_then(|n| n.to_str()))
                 .map(|s| s.to_string())
         })
-        .unwrap_or_else(|| session.project_id.clone());
+        .unwrap_or_else(|| summary.project_id.clone());
 
-    // Count messages cheaply via a single COUNT query rather than loading
-    // every part. Even on sessions with hundreds of messages this is sub-ms.
-    let message_count = opencode_message_count(db, &session.id);
-
-    let (summary, preview_role) = if !session.title.trim().is_empty() {
+    let (summary_text, preview_role) = if !summary.title.trim().is_empty() {
         (
-            truncate_summary(&session.title, 100),
+            truncate_summary(&summary.title, 100),
             MessageRole::Assistant,
         )
     } else {
-        // Title hasn't been generated yet — pull the first user message's text.
-        let messages = opencode::load_messages(db, &session.id);
+        // Title hasn't been generated yet — bounded fallback inside the
+        // LIMIT window.
+        let messages = opencode::load_messages(db, &summary.id);
         let first_user = messages.into_iter().find(|m| m.role == MessageRole::User)?;
         let text = first_user
             .content_blocks
@@ -886,35 +890,28 @@ pub fn opencode_session_to_recent(db: &Path, session: &OpencodeSession) -> Optio
         (truncate_summary(trimmed, 100), MessageRole::User)
     };
 
-    let cwd = session.directory.as_ref().map(|raw| {
+    let cwd = summary.directory.as_ref().map(|raw| {
         std::fs::canonicalize(raw)
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| raw.clone())
     });
 
+    let message_count = (summary.message_count > 0).then_some(summary.message_count);
+
     Some(RecentSession {
-        session_id: session.id.clone(),
-        file_path: session.session_file.to_string_lossy().to_string(),
+        session_id: summary.id.clone(),
+        file_path: summary.session_file.to_string_lossy().to_string(),
         project,
         source: SessionSource::CLI,
-        timestamp: session.updated_at,
-        summary,
+        timestamp: summary.updated_at,
+        summary: summary_text,
         automation: None,
         branch: None,
         message_count,
         preview_role,
         cwd,
     })
-}
-
-fn opencode_message_count(db: &Path, session_id: &str) -> Option<usize> {
-    let conn = opencode::open_db(db).ok()?;
-    let mut stmt = conn
-        .prepare("SELECT COUNT(*) FROM message WHERE session_id = ?1")
-        .ok()?;
-    let count: i64 = stmt.query_row([session_id], |row| row.get(0)).ok()?;
-    (count > 0).then_some(count as usize)
 }
 
 /// Pick the Opencode SQLite databases to query for a given set of search
@@ -966,10 +963,10 @@ pub fn collect_opencode_recent_sessions(
 
     let mut sessions: Vec<RecentSession> = Vec::new();
     for db in &dbs {
-        let listing = list_sessions(db);
+        let listing = opencode::list_sessions_for_recent(db, limit);
         let from_this_db: Vec<RecentSession> = listing
             .par_iter()
-            .filter_map(|s| opencode_session_to_recent(db, s))
+            .filter_map(|s| opencode_summary_to_recent(db, s))
             .collect();
         sessions.extend(from_this_db);
     }

@@ -439,9 +439,13 @@ pub fn collect_session_jsonl_files(search_paths: &[String]) -> Vec<PathBuf> {
 pub fn find_session_file_in_paths(session_id: &str, search_paths: &[String]) -> Option<String> {
     use std::io::{BufRead, BufReader};
 
-    // Opencode session IDs start with `ses_` and live in a SQLite DB.
+    // Opencode session IDs start with `ses_` and live in a SQLite DB. Resolve
+    // them against the caller's `search_paths` first so explicit DBs (e.g.
+    // `CCFS_SEARCH_PATH=/path/to/side.db`) win over the default database;
+    // `opencode_databases_for_search_paths` already falls back to the default
+    // when no explicit DB entries are present.
     if session_id.starts_with("ses_") {
-        if let Some(db) = opencode::opencode_database_path() {
+        for db in crate::recent::opencode_databases_for_search_paths(search_paths) {
             if opencode::OpencodeSession::from_db(&db, session_id).is_some() {
                 return Some(opencode::synthetic_session_path(&db, session_id));
             }
@@ -1156,5 +1160,103 @@ mod tests {
             find_session_file_in_paths("desktop-123", &[dir.path().to_string_lossy().to_string()]);
 
         assert_eq!(found, Some(audit.to_string_lossy().to_string()));
+    }
+
+    fn build_opencode_db_with_session(db_path: &Path, session_id: &str) {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (
+                id TEXT PRIMARY KEY,
+                worktree TEXT NOT NULL,
+                vcs TEXT,
+                name TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                slug TEXT NOT NULL DEFAULT '',
+                directory TEXT,
+                title TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            INSERT INTO project VALUES ('p1', '/tmp/p', 'git', 'p', 1, 1);
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES (?1, 'p1', 's', '/tmp/p', 't', 1, 1)",
+            [session_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_find_session_file_in_paths_prefers_explicit_opencode_db() {
+        // An explicit opencode.db in search_paths must win over the default
+        // database returned by opencode_database_path(). We don't touch any
+        // env vars here — opencode_databases_for_search_paths short-circuits
+        // to explicit DBs whenever any search-path entry mentions
+        // `/opencode.db`, so the developer's real DB never gets consulted.
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("opencode.db");
+        build_opencode_db_with_session(&db, "ses_explicit");
+
+        let found =
+            find_session_file_in_paths("ses_explicit", &[db.to_string_lossy().into_owned()]);
+        assert_eq!(
+            found,
+            Some(opencode::synthetic_session_path(&db, "ses_explicit"))
+        );
+    }
+
+    #[test]
+    fn test_find_session_file_in_paths_falls_back_to_default_opencode_db() {
+        // When search_paths contains no explicit opencode.db entry, lookup
+        // must fall back to the default database (resolved via
+        // `OPENCODE_DATA` here for test isolation).
+        use tempfile::TempDir;
+
+        let _lock = crate::TEST_ENV_MUTEX.lock().unwrap();
+        let _env_guard = crate::EnvGuard::new(&["OPENCODE_DATA", "XDG_DATA_HOME"]);
+
+        // SAFETY: tests run single-threaded behind TEST_ENV_MUTEX.
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("opencode.db");
+        build_opencode_db_with_session(&db, "ses_default");
+        unsafe { std::env::set_var("OPENCODE_DATA", dir.path()) };
+
+        // search_paths has no `.db` entry — must trigger the default-DB path.
+        let unrelated = TempDir::new().unwrap();
+        let found = find_session_file_in_paths(
+            "ses_default",
+            &[unrelated.path().to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            found,
+            Some(opencode::synthetic_session_path(&db, "ses_default"))
+        );
     }
 }

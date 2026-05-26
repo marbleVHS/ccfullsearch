@@ -5,6 +5,7 @@ use crate::session::{self, SessionProvider, SessionSource};
 use regex::RegexBuilder;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -213,18 +214,13 @@ fn search_multiple_paths_inner(
         }
 
         // Opencode storage roots are not JSONL-shaped — dispatch to a
-        // separate scanner that globs `*.json` under `<root>/part/` and
-        // resolves matches back to a session via metadata lookup.
+        // separate scanner that streams matches from the SQLite database
+        // via a single JOIN query (no per-hit metadata lookups).
         if is_opencode_storage_path(search_path) {
-            let results = search_opencode_storage(
-                query,
-                search_path,
-                use_regex,
-                regex_matcher.as_ref(),
-                cancel,
-                extra_args,
-            )?;
+            let (results, truncated) =
+                search_opencode_storage(query, search_path, regex_matcher.as_ref(), cancel)?;
             all_results.extend(results);
+            any_truncated |= truncated;
             continue;
         }
 
@@ -528,28 +524,37 @@ fn is_opencode_storage_path(path: &str) -> bool {
     } else {
         path.to_string()
     };
-    normalized.ends_with("/opencode.db") || normalized.contains("/opencode.db")
+    normalized.contains("/opencode.db")
 }
 
 /// Search the Opencode SQLite database for the given query.
 ///
-/// Backed by [`opencode::search_parts`], which runs a case-insensitive `LIKE`
-/// against the `part.data` JSON column and post-filters in Rust against the
-/// rendered (user-visible) text. For each hit we look up the owning session
-/// and message metadata so the result carries the same shape as a JSONL
-/// ripgrep match: synthetic `file_path = <db>#<session_id>`, role pulled from
-/// `message.role`, timestamp from `message.time.created`.
+/// Backed by [`opencode::search_parts_streaming`], which runs a single JOIN
+/// against `part`/`message`/`session` and yields one row per matching
+/// `(session_id, message_id)` pair. We cap at `MAX_COUNT_PER_FILE` matches
+/// **across the whole database** (the DB is treated as a single "file" for
+/// dispatch purposes), unlike the ripgrep path which applies the cap per
+/// JSONL file. Rows are streamed in `p.time_created DESC` order, so when
+/// the cap fires the newest matches are kept and older sessions may be
+/// silently dropped — truncation is surfaced via the returned flag so the
+/// caller can warn the user. The cancel token is honoured both by the
+/// streaming layer (polled every ~64 rows) and by the early-exit check
+/// below.
+///
+/// Returns `(matches, truncated)`. `truncated` is `true` when the
+/// `MAX_COUNT_PER_FILE` cap was hit and additional matches were left
+/// unstreamed. On mid-stream SQL errors (corrupt/locked DB) we suppress
+/// the error to keep the mixed-provider search flowing and return whatever
+/// rows were collected before the error, rather than discarding them.
 fn search_opencode_storage(
     query: &str,
     storage_path: &str,
-    _use_regex: bool,
     regex_matcher: Option<&regex::Regex>,
     cancel: &Arc<AtomicBool>,
-    _extra_args: &[String],
-) -> Result<Vec<RipgrepMatch>, String> {
+) -> Result<(Vec<RipgrepMatch>, bool), String> {
     let db = PathBuf::from(storage_path);
     if !db.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
 
     if cancel.load(Ordering::Relaxed) {
@@ -564,50 +569,54 @@ fn search_opencode_storage(
         Some(re) => opencode::SearchMode::Regex(re),
         None => opencode::SearchMode::Fixed,
     };
-    let hits = opencode::search_parts(&db, query, mode);
 
-    if cancel.load(Ordering::Relaxed) {
-        return Err("cancelled".into());
-    }
+    let mut results: Vec<RipgrepMatch> = Vec::new();
+    let mut truncated = false;
 
-    let mut session_cache: HashMap<String, Option<OpencodeSession>> = HashMap::new();
-    let mut results = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let session = session_cache
-            .entry(hit.session_id.clone())
-            .or_insert_with(|| OpencodeSession::from_db(&db, &hit.session_id))
-            .clone();
-        let Some(session) = session else {
-            continue;
+    // Isolate Opencode DB failures so a corrupt, locked, or
+    // schema-incompatible database doesn't poison the whole mixed-provider
+    // search — Claude/Codex hits from other paths must still surface. Mirror
+    // the tolerant pattern used by `recent::list_sessions_for_recent` and
+    // `cli::collect_opencode_list_entries`. Cancellation is the one error we
+    // must keep propagating so the search machinery can short-circuit.
+    let outcome = opencode::search_parts_streaming(&db, query, mode, cancel, |row| {
+        let role_str = match row.role {
+            crate::session::record::MessageRole::User => "user".to_string(),
+            crate::session::record::MessageRole::Assistant => "assistant".to_string(),
         };
 
-        let (role, timestamp) = opencode::read_message_role_and_time(&db, &hit.message_id)
-            .map(|(role, ts)| {
-                let role_str = match role {
-                    crate::session::record::MessageRole::User => "user",
-                    crate::session::record::MessageRole::Assistant => "assistant",
-                };
-                (role_str.to_string(), ts)
-            })
-            .unwrap_or_else(|| ("assistant".to_string(), session.updated_at));
-
         results.push(RipgrepMatch {
-            file_path: session.session_file.to_string_lossy().to_string(),
+            file_path: row.session_file.to_string_lossy().to_string(),
             message: Some(Message {
-                session_id: session.id.clone(),
-                role,
-                content: hit.text.clone(),
-                text_content: hit.text,
-                timestamp,
+                session_id: row.session_id,
+                role: role_str,
+                content: row.text.clone(),
+                text_content: row.text,
+                timestamp: row.timestamp,
                 branch: None,
                 line_number: 1,
-                uuid: Some(hit.message_id),
+                uuid: Some(row.message_id),
                 parent_uuid: None,
             }),
             source: SessionSource::CLI,
         });
+
+        if results.len() >= MAX_COUNT_PER_FILE {
+            truncated = true;
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+
+    match outcome {
+        Ok(()) => Ok((results, truncated)),
+        Err(e) if e == "cancelled" => Err(e),
+        // Preserve whatever rows were collected before the error rather than
+        // discarding them: a mid-stream SQL failure (locked DB, decode error)
+        // can fire after hundreds of valid matches have already been pushed.
+        Err(_) => Ok((results, truncated)),
     }
-    Ok(results)
 }
 
 /// Check if a file path belongs to an agent or subagent session.
@@ -689,7 +698,7 @@ pub fn extract_project_from_path(path: &str) -> String {
     }
 
     // Opencode synthetic path: `<db>#<session_id>`. Resolve through the DB
-    // so the project label matches what `list_sessions` / recent uses.
+    // so the project label matches what `list_sessions_for_recent` / recent uses.
     if SessionProvider::from_path(path) == SessionProvider::Opencode {
         if let Some((db, sid)) = opencode::parse_session_path(path) {
             if let Some(session) = OpencodeSession::from_db(&db, &sid) {
@@ -1541,6 +1550,198 @@ mod tests {
             truncated,
             "Should detect truncation when file has more matches than max-count"
         );
+    }
+
+    #[test]
+    fn test_search_opencode_caps_at_max_count_and_reports_truncation() {
+        // Build a minimal Opencode DB where the number of matching messages
+        // exceeds MAX_COUNT_PER_FILE. Each message gets its own matching
+        // text part — dedupe is by (session_id, message_id), so this
+        // produces MAX_COUNT_PER_FILE + N distinct hits before the cap fires.
+        use rusqlite::Connection;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT,
+                name TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                slug TEXT NOT NULL DEFAULT '', directory TEXT, title TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            INSERT INTO project VALUES ('p', '/tmp/p', 'git', 'p', 1, 2);
+            INSERT INTO session VALUES ('ses_BIG', 'p', '', '/tmp/p', 't', 1, 2);
+            "#,
+        )
+        .unwrap();
+
+        let extra = 25usize;
+        for i in 0..(MAX_COUNT_PER_FILE + extra) {
+            let mid = format!("m{:05}", i);
+            conn.execute(
+                "INSERT INTO message VALUES (?1, 'ses_BIG', ?2, ?2, ?3)",
+                rusqlite::params![
+                    mid,
+                    1_000_000_000_i64 + i as i64,
+                    r#"{"role":"user","time":{"created":1000000000}}"#
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO part VALUES (?1, ?2, 'ses_BIG', ?3, ?3, ?4)",
+                rusqlite::params![
+                    format!("p{:05}", i),
+                    mid,
+                    1_000_000_000_i64 + i as i64,
+                    r#"{"type":"text","text":"findme opencode"}"#
+                ],
+            )
+            .unwrap();
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (results, truncated) =
+            search_opencode_storage("findme", db_path.to_str().unwrap(), None, &cancel)
+                .expect("opencode search should succeed");
+
+        assert_eq!(
+            results.len(),
+            MAX_COUNT_PER_FILE,
+            "results must be capped at MAX_COUNT_PER_FILE"
+        );
+        assert!(
+            truncated,
+            "truncated flag must be set when the cap is hit with more matches available"
+        );
+    }
+
+    #[test]
+    fn test_search_opencode_below_cap_does_not_flag_truncation() {
+        use rusqlite::Connection;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT,
+                name TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                slug TEXT NOT NULL DEFAULT '', directory TEXT, title TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            INSERT INTO project VALUES ('p', '/tmp/p', 'git', 'p', 1, 2);
+            INSERT INTO session VALUES ('ses_SMALL', 'p', '', '/tmp/p', 't', 1, 2);
+            INSERT INTO message VALUES ('m1', 'ses_SMALL', 100, 100, '{"role":"user","time":{"created":100}}');
+            INSERT INTO part VALUES ('p1', 'm1', 'ses_SMALL', 100, 100, '{"type":"text","text":"findme"}');
+            "#,
+        )
+        .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (results, truncated) =
+            search_opencode_storage("findme", db_path.to_str().unwrap(), None, &cancel)
+                .expect("opencode search should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert!(!truncated, "no truncation when matches < cap");
+    }
+
+    #[test]
+    fn test_search_opencode_corrupt_db_returns_empty_not_error() {
+        // A file at an `opencode.db` path that isn't a valid SQLite database
+        // (corrupt header, truncated file, schema mismatch, …) must not poison
+        // the mixed-provider search. The Opencode scanner returns no matches,
+        // and the surrounding `search_multiple_paths_inner` keeps walking the
+        // other (JSONL) search paths.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("opencode.db");
+        std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (results, truncated) =
+            search_opencode_storage("findme", db_path.to_str().unwrap(), None, &cancel)
+                .expect("corrupt opencode db must not propagate as a search error");
+        assert!(
+            results.is_empty(),
+            "corrupt opencode db should yield no matches"
+        );
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_search_opencode_corrupt_db_does_not_break_mixed_search() {
+        // End-to-end: a JSONL search path with a real match plus an Opencode
+        // path pointing at a corrupt DB. The Claude hit must still surface.
+        let temp_dir = TempDir::new().unwrap();
+        let session_content = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"findme Claude"}]},"sessionId":"abc123","timestamp":"2025-01-09T10:00:00Z"}"#;
+        create_test_session(&temp_dir, "session.jsonl", session_content);
+
+        let db_dir = TempDir::new().unwrap();
+        let db_path = db_dir.path().join("opencode.db");
+        std::fs::write(&db_path, b"not a sqlite database").unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = search_multiple_paths(
+            "findme",
+            &[
+                temp_dir.path().to_str().unwrap().to_string(),
+                db_path.to_str().unwrap().to_string(),
+            ],
+            false,
+            &cancel,
+        )
+        .expect("mixed search must succeed even with a broken Opencode DB");
+        assert!(
+            !result.matches.is_empty(),
+            "Claude hit must surface despite Opencode failure"
+        );
+        assert!(result.matches.iter().any(|m| m
+            .message
+            .as_ref()
+            .is_some_and(|msg| msg.content.contains("findme"))));
+    }
+
+    #[test]
+    fn test_search_opencode_propagates_cancellation() {
+        // A pre-set cancel token must still surface as Err("cancelled") so the
+        // outer search loop can short-circuit instead of treating cancel as a
+        // benign "no matches" outcome.
+        use rusqlite::Connection;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT,
+                name TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                slug TEXT NOT NULL DEFAULT '', directory TEXT, title TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL, time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+            "#,
+        )
+        .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let err = search_opencode_storage("findme", db_path.to_str().unwrap(), None, &cancel)
+            .expect_err("pre-cancelled search must return Err");
+        assert_eq!(err, "cancelled");
     }
 
     #[test]

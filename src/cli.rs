@@ -95,7 +95,7 @@ pub fn cli_list(search_paths: &[String], limit: usize) {
     // `collect_recent_sessions` so tests with synthetic temp roots don't
     // pick up the user's real DB.
     if search_paths.iter().any(|p| p.contains("/opencode.db")) {
-        sessions.extend(collect_opencode_list_entries(search_paths));
+        sessions.extend(collect_opencode_list_entries(search_paths, limit));
     }
 
     // Sort by last_active descending
@@ -112,27 +112,28 @@ pub fn cli_list(search_paths: &[String], limit: usize) {
     }
 }
 
-fn collect_opencode_list_entries(search_paths: &[String]) -> Vec<ListResult> {
+fn collect_opencode_list_entries(search_paths: &[String], limit: usize) -> Vec<ListResult> {
     use crate::recent::opencode_databases_for_search_paths;
-    use crate::session::opencode::{self, list_sessions, load_messages};
+    use crate::session::opencode::list_sessions_for_recent;
     let dbs = opencode_databases_for_search_paths(search_paths);
     if dbs.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
     for db in &dbs {
-        for session in list_sessions(db) {
-            let project = opencode::read_project_label(db, &session.project_id)
-                .unwrap_or_else(|| session.project_id.clone());
-            let message_count = load_messages(db, &session.id).len();
+        for summary in list_sessions_for_recent(db, limit) {
+            let project = summary
+                .project_label
+                .clone()
+                .unwrap_or_else(|| summary.project_id.clone());
             out.push(ListResult {
-                session_id: session.id,
+                session_id: summary.id,
                 project,
                 provider: "Opencode".to_string(),
                 source: SessionSource::CLI.display_name().to_string(),
-                file_path: session.session_file.to_string_lossy().to_string(),
-                last_active: session.updated_at.to_rfc3339(),
-                message_count,
+                file_path: summary.session_file.to_string_lossy().to_string(),
+                last_active: summary.updated_at.to_rfc3339(),
+                message_count: summary.message_count,
             });
         }
     }

@@ -370,6 +370,7 @@ fn group_matches_project(
     group: &SessionGroup,
     project_paths: &[String],
     current_cwd: Option<&str>,
+    opencode_cwd_cache: &mut HashMap<String, Option<String>>,
 ) -> bool {
     if project_paths
         .iter()
@@ -385,7 +386,9 @@ fn group_matches_project(
 
     let session_cwd = match provider {
         SessionProvider::Codex => crate::session::read_codex_session_cwd(&group.file_path),
-        SessionProvider::Opencode => read_opencode_session_cwd(&group.file_path),
+        SessionProvider::Opencode => {
+            read_opencode_session_cwd_cached(&group.file_path, opencode_cwd_cache)
+        }
         SessionProvider::Claude => return false,
     };
 
@@ -400,6 +403,22 @@ fn group_matches_project(
 fn read_opencode_session_cwd(file_path: &str) -> Option<String> {
     let (db, sid) = crate::session::opencode::parse_session_path(file_path)?;
     crate::session::opencode::OpencodeSession::from_db(&db, &sid)?.directory
+}
+
+/// Cache-aware wrapper for [`read_opencode_session_cwd`]. Opencode lookups
+/// open the SQLite DB, so the project-filter rebuild can run hundreds of
+/// these per toggle. Cache both `Some` and `None` outcomes so repeated
+/// misses are also O(1).
+fn read_opencode_session_cwd_cached(
+    file_path: &str,
+    cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    if let Some(cached) = cache.get(file_path) {
+        return cached.clone();
+    }
+    let result = read_opencode_session_cwd(file_path);
+    cache.insert(file_path.to_string(), result.clone());
+    result
 }
 
 /// Recent sessions sub-state: encapsulates global/project data sources,
@@ -867,6 +886,10 @@ pub struct App {
     pub automation_filter: AutomationFilter,
     /// Cache: file_path -> resolved automation marker (including negative lookups)
     automation_cache: HashMap<String, Option<String>>,
+    /// Cache: Opencode synthetic file_path (`<db>#<sid>`) -> session
+    /// directory. Opens of the Opencode SQLite DB are amortised across
+    /// repeated project-filter rebuilds; caches both `Some` and `None`.
+    opencode_cwd_cache: HashMap<String, Option<String>>,
     /// All search paths (for "all sessions" mode)
     pub(crate) all_search_paths: Vec<String>,
     /// Search path(s) for current project only
@@ -957,6 +980,7 @@ impl App {
             project_filter: false,
             automation_filter: AutomationFilter::Manual,
             automation_cache: HashMap::new(),
+            opencode_cwd_cache: HashMap::new(),
             all_search_paths,
             current_project_paths,
             current_cwd,
@@ -1488,25 +1512,31 @@ impl App {
 
     /// Rebuild `groups` from `all_groups` based on project and automation filters.
     pub(crate) fn apply_groups_filter(&mut self) {
-        self.search.groups = self
-            .search
-            .all_groups
+        // Split-borrow: `all_groups` is read while `opencode_cwd_cache`
+        // is mutated by `group_matches_project`. Bind each field of `self`
+        // to its own local so the borrow checker tracks them independently.
+        let project_filter = self.project_filter;
+        let automation_filter = self.automation_filter;
+        let project_paths = &self.current_project_paths;
+        let current_cwd = self.current_cwd.as_deref();
+        let opencode_cwd_cache = &mut self.opencode_cwd_cache;
+        let all_groups = &self.search.all_groups;
+
+        let new_groups: Vec<SessionGroup> = all_groups
             .iter()
             .filter(|g| {
-                !self.project_filter
-                    || group_matches_project(
-                        g,
-                        &self.current_project_paths,
-                        self.current_cwd.as_deref(),
-                    )
+                !project_filter
+                    || group_matches_project(g, project_paths, current_cwd, opencode_cwd_cache)
             })
-            .filter(|g| match self.automation_filter {
+            .filter(|g| match automation_filter {
                 AutomationFilter::All => true,
                 AutomationFilter::Manual => g.automation.is_none(),
                 AutomationFilter::Auto => g.automation.is_some(),
             })
             .cloned()
             .collect();
+
+        self.search.groups = new_groups;
         // Clamp cursor so it stays valid after the filtered list shrinks
         // (e.g. async automation metadata arrives while Manual/Auto filter is active).
         if self.search.groups.is_empty() {
@@ -4602,6 +4632,63 @@ mod tests {
             observer.load(Ordering::Relaxed),
             "Drop on App must set the in-flight handle's cancel flag"
         );
+    }
+
+    #[test]
+    fn test_read_opencode_session_cwd_cached_survives_db_removal() {
+        // First call hits the SQLite DB; the resolved directory is stored in
+        // the cache. Removing the DB on disk between calls must NOT cause
+        // the second call to miss — the cache is the load-bearing path for
+        // repeated project-filter rebuilds.
+        use rusqlite::Connection;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT,
+                name TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                slug TEXT NOT NULL DEFAULT '', directory TEXT, title TEXT NOT NULL,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            INSERT INTO project VALUES ('p', '/tmp/p', 'git', 'p', 1, 2);
+            INSERT INTO session VALUES ('ses_OC', 'p', '', '/tmp/cached-cwd', 't', 1, 2);
+            "#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let synth = format!("{}#ses_OC", db_path.to_string_lossy());
+        let mut cache: HashMap<String, Option<String>> = HashMap::new();
+
+        let first = read_opencode_session_cwd_cached(&synth, &mut cache);
+        assert_eq!(first.as_deref(), Some("/tmp/cached-cwd"));
+        assert!(
+            cache.contains_key(&synth),
+            "cache must store the resolved cwd after the first lookup"
+        );
+
+        // Wipe the DB so any uncached lookup would return None.
+        std::fs::remove_file(&db_path).unwrap();
+
+        let second = read_opencode_session_cwd_cached(&synth, &mut cache);
+        assert_eq!(
+            second.as_deref(),
+            Some("/tmp/cached-cwd"),
+            "second call must return cached value despite DB removal"
+        );
+
+        // Negative lookups are also cached so repeated misses stay O(1).
+        let missing_synth = format!("{}#ses_MISSING", db_path.to_string_lossy());
+        let first_miss = read_opencode_session_cwd_cached(&missing_synth, &mut cache);
+        assert!(first_miss.is_none());
+        assert!(
+            cache.contains_key(&missing_synth),
+            "negative lookups must be cached"
+        );
+        let second_miss = read_opencode_session_cwd_cached(&missing_synth, &mut cache);
+        assert!(second_miss.is_none());
     }
 
     // Drop on `App` must also cancel the background message-count thread
